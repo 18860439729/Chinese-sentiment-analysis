@@ -1,0 +1,45 @@
+# 项目配置文件 - 避免硬编码路径
+
+# 数据路径配置
+data:
+  dataset_dir: "dataset"  # JSON数据集目录
+  train_file: "train.json"
+  dev_file: "dev.json" 
+  test_file: "test.json"
+
+# 模型配置
+model:
+  bert_model_name: "bert-base-chinese"
+  hgnn_hidden_dims: [512, 256]
+  num_attention_heads: 8
+  num_classes: 2  # 讽刺检测：0-非讽刺，1-讽刺
+  dropout: 0.1
+  freeze_bert: false
+  max_length: 512
+
+# 训练配置
+training:
+  batch_size: 16  # 减小批次大小以适应超图计算
+  epochs: 30
+  learning_rate: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+
+# 早停配置
+early_stopping:
+  patience: 5
+  min_delta: 0.001
+
+# HanLP配置
+hanlp:
+  model_path: null  # 使用默认模型
+
+# 输出配置
+output:
+  save_dir: "./checkpoints"
+  log_dir: "./logs"
+
+# 其他配置
+misc:
+  seed: 42
+  device: "auto"  # auto, cpu, cuda

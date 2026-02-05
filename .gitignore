@@ -1,0 +1,10 @@
+.venv/
+dataset/
+logs/
+preprocessed_data/
+checkpoints/
+.idea/
+.vscode/
+*.pkl
+*.log
+__pycache__/

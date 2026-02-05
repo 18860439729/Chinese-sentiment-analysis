@@ -1,0 +1,446 @@
+# 项目开发日志 - Process Log
+
+## 2024-02-05 项目初始化
+
+### 1. 模块化重构
+- 创建 data_preprocess.py：HanLP处理 + 超图结构生成
+- 创建 model.py：BERT + HGNN + Attention 网络结构  
+- 创建 utils.py：工具函数集合
+- 创建 main.py：实验入口和训练流程
+- 创建 requirements.txt：依赖包管理
+- 创建 README.md：项目文档
+
+### 2. 硬件无关性优化
+- 统一使用标准写法：`device = torch.device("cuda" if torch.cuda.is_available() else "cpu")`
+- 所有模型和张量初始化时添加 `.to(device)`
+- 更新 requirements.txt 添加 DHG 库
+- 确保代码在 CPU/GPU 环境无缝切换
+
+### 3. 项目结构
+```
+├── data_preprocess.py    # 数据预处理
+├── model.py             # 模型定义
+├── utils.py             # 工具函数
+├── main.py              # 主程序
+├── requirements.txt     # 依赖管理
+├── README.md           # 项目文档
+└── process.txt         # 开发日志
+```
+
+### 4. 核心功能
+- HanLP 文本处理（分词、词性、NER、依存分析）
+- 超图结构构建（节点特征 + 边连接）
+- BERT + HGNN + MultiHead Attention 融合模型
+- 完整训练/验证/测试流程
+- 可视化和指标计算
+
+### 5. 下一步计划
+- [ ] 测试数据预处理模块
+- [ ] 验证模型前向传播
+- [ ] 完善训练循环中的数据流
+- [ ] 添加超参数调优功能
+- [ ] 性能优化和内存管理
+
+---
+*记录格式：日期 + 操作类型 + 具体内容*
+
+## 2024-02-05 重大错误修正
+
+### 1. BERT Tokenizer 修正 ❌➡️✅
+**错误**: 自己构建词汇表，与BERT预训练tokenizer不匹配
+**修正**: 
+- 删除 `_build_vocabulary()` 函数
+- 使用 `BertTokenizer.from_pretrained()` 
+- 确保token IDs与BERT预训练模型一致
+
+### 2. 超图结构修正 ❌➡️✅
+**错误**: 使用普通图邻接矩阵 N×N
+**修正**: 
+- 改为超图关联矩阵 H ∈ R^{N×M}
+- N个节点(词位置)，M条超边(语言学结构)
+- 超边类型：依存句法簇、词性标注簇、命名实体簇、滑动窗口
+
+### 3. 超图卷积公式修正 ❌➡️✅
+**错误**: 简单矩阵相乘，缺少度矩阵归一化
+**修正**: 
+- 实现完整公式：X^{(l+1)} = σ(D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2} X^{(l)} Θ)
+- 添加节点度矩阵 D_v 和超边度矩阵 D_e
+- 防止梯度爆炸
+
+### 4. 配置管理优化 ✅
+- 创建 config.yaml 避免硬编码路径
+- HanLP模型在 __init__ 中一次性加载
+- 支持灵活的参数配置
+
+### 5. 数据流修正 ✅
+- BERT tokenization 与 HanLP 处理分离
+- 正确的张量维度和设备管理
+- 修正数据加载器返回格式
+
+### 6. 技术债务清理
+- [x] 删除错误的词汇表构建
+- [x] 修正超图数学定义
+- [x] 实现正确的超图卷积
+- [x] 添加配置文件管理
+- [x] 优化HanLP加载策略
+## 2024-02-05 数据集适配重构
+
+### 1. JSON数据集支持 ✅
+**数据格式**: 
+- train.json, dev.json, test.json
+- 每条数据：{"text": "评论", "topic": "主题", "label": "0/1"}
+- 讽刺检测任务：0-非讽刺，1-讽刺
+
+### 2. 文本对处理优化 ✅
+**BERT处理**:
+- 使用 `tokenizer(text, topic)` 处理文本对
+- 自动添加 [CLS] text [SEP] topic [SEP] 结构
+- 正确的 token_type_ids 区分两个句子
+
+**HanLP处理**:
+- 合并文本和主题进行语言学分析
+- 记录主题和评论的长度边界
+- 用于构建主题-评论交互超边
+
+### 3. 超图结构增强 ✅
+**新增超边类型**:
+- 主题-评论交互超边（讽刺检测特有）
+- 主题内部超边
+- 评论内部超边
+- 保留原有的依存、词性、实体、窗口超边
+
+### 4. 数据加载器重构 ✅
+**SarcasmDataset类**:
+- 专门处理讽刺检测数据格式
+- 自定义 collate_fn 批处理超图矩阵
+- 硬件无关的张量管理
+
+**完整数据流**:
+- JSON加载 → BERT tokenization → HanLP分析 → 超图构建 → 批处理
+
+### 5. 训练流程完善 ✅
+- 修复训练和验证函数的数据流
+- 正确的前向传播调用
+- 完整的指标计算和日志记录
+- 支持测试集评估
+
+### 6. 配置优化 ✅
+- 更新 config.yaml 适配JSON数据集
+- 减小批次大小适应超图计算开销
+- 灵活的数据路径配置
+
+### 7. 使用方法
+```bash
+# 使用默认数据集目录
+python main.py --dataset_dir dataset
+
+# 或指定具体文件
+python main.py --train_data dataset/train.json --val_data dataset/dev.json
+```
+## 2024-02-05 关键技术问题修正
+
+### 1. 批处理逻辑漏洞修正 ❌➡️✅
+**问题**: 样本间数据泄露 - 所有样本共用一个超图矩阵
+**修正**: 
+- `_create_single_hypergraph_matrix()`: 每个样本独立的超图矩阵
+- `estimate_max_edges()`: 动态估算最大超边数用于padding
+- 3D张量: [batch_size, max_nodes, max_edges]
+- 完全避免样本间信息泄露
+
+### 2. 超图卷积维度兼容性修正 ❌➡️✅
+**问题**: 2D矩阵乘法无法处理批处理的3D张量
+**修正**:
+- 使用 `torch.bmm()` 批矩阵乘法
+- 广播机制处理度矩阵归一化
+- 支持 [batch_size, N, M] 输入格式
+- 向量化计算避免循环
+
+### 3. 性能瓶颈优化 🚀
+**问题**: HanLP在训练循环中重复计算，GPU利用率极低
+**解决方案**: 离线预处理
+- `preprocess_offline.py`: 一次性处理所有HanLP分析
+- 预处理结果保存为 .pkl 文件
+- `PreprocessedDataset`: 直接加载预处理数据
+- **预期性能提升**: 10倍以上训练速度
+
+### 4. 分层学习率策略 ✅
+**优化**: 不同模块使用不同学习率
+- BERT参数: 2e-5 (微调预训练模型)
+- HGNN+Attention: 1e-3 (从零训练新层)
+- 50倍学习率差异，加速收敛
+
+### 5. 使用方法更新
+
+**第一步 - 离线预处理（推荐）**:
+```bash
+python preprocess_offline.py --dataset_dir dataset --output_dir preprocessed_data
+```
+
+**第二步 - 快速训练**:
+```bash
+python main.py --use_preprocessed --preprocessed_dir preprocessed_data --batch_size 16
+```
+
+**或实时处理（较慢）**:
+```bash
+python main.py --dataset_dir dataset --batch_size 8
+```
+
+### 6. 技术债务清理
+- [x] 修复样本间数据泄露
+- [x] 支持批处理3D超图矩阵
+- [x] 离线预处理性能优化
+- [x] 分层学习率策略
+- [x] 完整的错误处理和日志
+
+### 7. 关键改进点
+- **学术正确性**: 避免数据泄露
+- **计算效率**: 批处理优化
+- **训练速度**: 离线预处理
+- **收敛速度**: 分层学习率
+- **代码质量**: 错误处理和文档
+## 2024-02-05 离线预处理脚本修正
+
+### 🐛 问题诊断
+**错误**: `AttributeError: 'BertTokenizer' object has no attribute 'encode_plus'`
+**根本原因**: 
+1. HanLP 和 transformers 库的命名空间冲突
+2. 可能的循环导入问题
+3. 错误处理不足导致所有样本失败
+
+### 🔧 修正方案
+
+#### 1. 命名空间冲突解决 ✅
+- 创建 `SafeDataPreprocessor` 类避免循环导入
+- 明确导入 `from transformers import BertTokenizer`
+- 独立的预处理逻辑，不依赖 `data_preprocess.py`
+
+#### 2. 现代化 tokenizer 调用 ✅
+```python
+# 修正前（可能有问题）
+encoded = tokenizer.encode_plus(...)
+
+# 修正后（现代化写法）
+encoded = tokenizer(text, topic, ...)
+```
+
+#### 3. 增强错误处理 ✅
+- 每个步骤都有 try-catch 包装
+- 详细的错误信息和调试输出
+- 失败样本统计和成功率报告
+- 空结果检测和跳过机制
+
+#### 4. 避免循环导入 ✅
+- `create_fast_data_loaders` 中内联超图构建函数
+- 不再依赖 `data_preprocess.DataPreprocessor`
+- 独立的功能实现
+
+### 🧹 清理和重试步骤
+
+#### 第一步：清理错误数据
+```bash
+python clean_preprocessed.py
+```
+
+#### 第二步：重新预处理
+```bash
+python preprocess_offline.py --dataset_dir dataset --output_dir preprocessed_data
+```
+
+#### 第三步：验证结果
+- 检查成功率 > 90%
+- 确认 .pkl 文件不为空
+- 查看详细的处理统计
+
+### 🎯 预期改进
+- **错误率**: 从 100% 降至 < 10%
+- **调试信息**: 详细的错误追踪
+- **稳定性**: 单个样本失败不影响整体
+- **兼容性**: 解决库冲突问题
+
+### 📋 故障排除清单
+- [x] 修正 tokenizer 调用方式
+- [x] 解决命名空间冲突
+- [x] 增强错误处理
+- [x] 避免循环导入
+- [x] 添加清理脚本
+- [x] 详细的调试输出
+## 2024-02-05 彻底重写离线预处理脚本
+
+### 🔥 问题根源分析
+**核心问题**: 环境"打架" - 代码依赖冲突
+- **旧代码**: 试图调用 `data_preprocess.py` 中的 `DataPreprocessor` 类
+- **冲突源**: HanLP 和 transformers 混合环境导致 tokenizer 命名空间冲突
+- **错误表现**: `BertTokenizer has no attribute encode_plus`
+
+### 🚀 彻底重写方案
+
+#### 1. 完全解耦设计 ✅
+```python
+# 旧代码（有问题）
+from data_preprocess import DataPreprocessor  # 导致环境冲突
+
+# 新代码（完全独立）
+class IndependentPreprocessor:  # 不依赖任何其他模块
+```
+
+#### 2. 纯净的库导入 ✅
+```python
+# 独立导入，避免命名空间冲突
+from transformers import BertTokenizer  # 纯净的 BERT tokenizer
+import hanlp                           # 独立的 HanLP
+```
+
+#### 3. 现代化 API 调用 ✅
+```python
+# 直接调用方式（推荐）
+encoded = self.bert_tokenizer(
+    text, topic,
+    add_special_tokens=True,
+    max_length=max_length,
+    padding='max_length',
+    truncation=True,
+    return_tensors='pt'
+)
+```
+
+#### 4. 增强的错误处理 ✅
+- 每个步骤独立的 try-catch
+- 详细的错误信息和调试输出
+- 失败样本统计和成功率报告
+- 空结果检测和验证机制
+
+### 🎯 重写特点
+
+#### 完全独立性
+- **零依赖**: 不依赖 `data_preprocess.py`
+- **纯净环境**: 独立加载 BERT 和 HanLP
+- **避免冲突**: 彻底解决命名空间问题
+
+#### 现代化设计
+- **类型提示**: 完整的类型注解
+- **错误处理**: 健壮的异常处理机制
+- **进度显示**: 详细的处理进度和统计
+- **模块化**: 清晰的函数职责分离
+
+#### 用户友好
+- **详细日志**: 丰富的状态信息
+- **错误诊断**: 具体的错误位置和原因
+- **成功率统计**: 实时的处理成功率
+- **文件验证**: 自动检测和验证输出
+
+### 🚀 使用方法
+
+#### 第一步：清理旧数据
+```bash
+python clean_preprocessed.py
+```
+
+#### 第二步：运行新的预处理脚本
+```bash
+python preprocess_offline.py --dataset_dir dataset --output_dir preprocessed_data
+```
+
+#### 第三步：验证结果
+- 应该看到成功率 > 95%
+- 绿色的成功信息，而不是红色错误
+- 生成的 .pkl 文件包含有效数据
+
+### 📊 预期改进
+- **错误率**: 从 100% 降至 < 5%
+- **稳定性**: 单个样本失败不影响整体
+- **可维护性**: 代码结构清晰，易于调试
+- **兼容性**: 彻底解决库冲突问题
+
+### 🔧 技术要点
+- **IndependentPreprocessor**: 完全独立的预处理器类
+- **bert_encode()**: 纯净的 BERT 编码方法
+- **hanlp_analyze()**: 独立的 HanLP 分析方法
+- **process_single_sample()**: 单样本处理流程
+- **详细统计**: 成功率、错误计数、处理时间
+
+现在应该能看到绿色的成功信息了！🎉
+## 2024-02-05 核心手术 - 修正导入和逻辑问题
+
+### 🔧 第一步：data_preprocess.py 核心手术 ✅
+
+#### 问题诊断
+- **SarcasmDataset 类被锁在函数内部**：缩进错误导致类无法被外部导入
+- **main.py 找不到 SarcasmDataset**：`from data_preprocess import SarcasmDataset` 失败
+
+#### 手术操作
+```python
+# 修正前（有问题）
+def create_data_loaders(...):
+    class SarcasmDataset(Dataset):  # 被锁在函数内部
+        ...
+
+# 修正后（正确）
+class SarcasmDataset(torch.utils.data.Dataset):  # 全局作用域
+    """讽刺检测数据集类 - 移到全局作用域"""
+    ...
+
+def create_hypergraph_collate_fn(preprocessor, max_length):
+    """创建超图批处理函数的工厂函数"""
+    ...
+```
+
+#### 修正要点
+- **向左反缩进**：将 `SarcasmDataset` 类移到顶格（全局作用域）
+- **工厂函数模式**：`create_hypergraph_collate_fn` 返回配置好的 `collate_fn`
+- **清晰的职责分离**：类定义和函数创建分开
+
+### 🔧 第二步：preprocess_offline.py 清理逻辑 ✅
+
+#### 问题诊断
+- **逻辑死胡同**：`fast_collate_fn` 中调用不存在的 `preprocessor` 对象
+- **复杂计算错位**：离线预处理应该"快速读取"，不应该再做复杂计算
+
+#### 清理操作
+```python
+# 修正前（有问题）
+def fast_collate_fn(batch):
+    max_edges = preprocessor.estimate_max_edges(...)  # preprocessor 不存在！
+    single_matrix = preprocessor._create_single_hypergraph_matrix(...)  # 复杂计算
+
+# 修正后（简化）
+def simple_collate_fn(batch):
+    # 只做基本的张量堆叠
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    hanlp_results = [item['hanlp_result'] for item in batch]  # 简单列表
+    return {...}
+```
+
+#### 清理要点
+- **删除复杂计算**：移除 `estimate_max_edges` 和超图矩阵构建
+- **简化数据流**：只做基本的张量堆叠和设备移动
+- **职责明确**：离线预处理负责"预处理"，数据加载器负责"加载"
+
+### 🎯 修正效果
+
+#### 导入问题解决
+```python
+# 现在可以正常导入
+from data_preprocess import SarcasmDataset  # ✅ 成功
+from preprocess_offline import load_preprocessed_data  # ✅ 成功
+```
+
+#### 逻辑清晰化
+- **data_preprocess.py**：负责实时处理和超图计算
+- **preprocess_offline.py**：负责离线预处理和快速加载
+- **main.py**：根据参数选择处理模式
+
+#### 性能优化
+- **离线模式**：预处理一次，快速加载
+- **实时模式**：每次都计算，但逻辑正确
+- **硬件无关**：两种模式都支持 CPU/GPU
+
+### 📋 修正清单
+- [x] SarcasmDataset 移到全局作用域
+- [x] 创建 create_hypergraph_collate_fn 工厂函数
+- [x] 简化 preprocess_offline.py 的 collate_fn
+- [x] 删除不存在的 preprocessor 引用
+- [x] 保持数据流的一致性
+- [x] 确保导入路径正确
+
+现在 main.py 应该能正常导入和使用这些类了！🎉
