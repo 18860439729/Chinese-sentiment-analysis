@@ -1,5 +1,4 @@
-# BERT + HGNN + Attention 文本分类模型【如果你觉得原作者的 README.md 以后可能有用（比如看数据集的标签定义），你可以把它也移出来改名为 README_ToSarcasm.md 留着备查】
-
+# BERT + HGNN + Attention 文本分类模型
 这是一个结合了BERT、超图神经网络(HGNN)和注意力机制的文本分类模型的模块化实现。
 
 ## 项目结构
