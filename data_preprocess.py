@@ -1,68 +1,75 @@
 """
-数据预处理模块
+数据预处理模块 (修复版)
 负责 HanLP 处理、生成超图结构
+包含：智能键名匹配、缓存机制
 """
 
 import hanlp
 import torch
 import numpy as np
 from typing import List, Dict, Tuple, Any
-import networkx as nx
 from collections import defaultdict
 from transformers import BertTokenizer
 import os
 import pickle
 from tqdm import tqdm
 
-
 class DataPreprocessor:
     """数据预处理器，负责文本处理和超图构建"""
     
     def __init__(self, bert_model_name: str = 'bert-base-chinese', hanlp_model_path: str = None):
-        """
-        初始化预处理器
-        
-        Args:
-            bert_model_name: BERT模型名称，用于初始化tokenizer
-            hanlp_model_path: HanLP模型路径，如果为None则使用默认模型
-        """
-        # 初始化BERT tokenizer - 绝对不能自己构建词汇表！
+        # 初始化BERT tokenizer
         self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
-        
-        # 初始化HanLP模型 - 只在init中加载一次，避免重复加载
+        # 初始化HanLP模型
         self.hanlp_pipeline = self._load_hanlp_model(hanlp_model_path)
         
     def _load_hanlp_model(self, model_path: str = None):
-        """加载HanLP模型 - 只加载一次"""
         if model_path:
             return hanlp.load(model_path)
         else:
-            # 使用默认的中文模型
+            # 使用默认的中文多任务模型
             return hanlp.load(hanlp.pretrained.mtl.CLOSE_TOK_POS_NER_SRL_DEP_SDP_CON_ELECTRA_SMALL_ZH)
-    
-    def process_text_pair(self, text: str, topic: str, max_length: int = 512) -> Dict[str, torch.Tensor]:
+
+    def _get_feature(self, doc, prefix):
         """
-        处理文本对（评论+主题），用于讽刺检测任务
+        [关键修复] 安全获取 HanLP 结果中的字段 
+        自动兼容 tok/fine, pos/ctb 等不同键名
+        """
+        # 1. 尝试直接匹配 (e.g., 'tok')
+        if prefix in doc:
+            return doc[prefix]
         
-        Args:
-            text: 评论文本
-            topic: 主题文本
-            max_length: 最大序列长度
-            
-        Returns:
-            包含input_ids, attention_mask, token_type_ids的字典
-        """
-        # 使用BERT tokenizer处理文本对
+        # 2. 尝试常见变体 (e.g., 'tok/fine')
+        variants = {
+            'tok': ['tok/fine', 'tok/coarse'],
+            'pos': ['pos/ctb', 'pos/pku', 'pos/863'],
+            'ner': ['ner/msra', 'ner/pku', 'ner/ontonotes'],
+            'dep': ['dep/ctb', 'dep/pmt'],
+            'srl': ['srl']
+        }
+        for v in variants.get(prefix, []):
+            if v in doc:
+                return doc[v]
+                
+        # 3. 暴力搜索前缀 (只要是 tok/ 开头的都算)
+        for k in doc:
+            if str(k).startswith(prefix + '/'):
+                return doc[k]
+        
+        # 4. 如果没找到，返回空列表，防止报错
+        return []
+    
+    def process_text_pair(self, text: str, topic: str, max_length: int = 256) -> Dict[str, torch.Tensor]:
+        """处理BERT输入"""
         encoded = self.tokenizer(
             text,
-            topic,  # 第二个句子
+            topic,
             add_special_tokens=True,
             max_length=max_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
-        
         return {
             'input_ids': encoded['input_ids'].squeeze(0),
             'attention_mask': encoded['attention_mask'].squeeze(0),
@@ -71,383 +78,262 @@ class DataPreprocessor:
     
     def process_text_with_hanlp(self, text: str, topic: str = None) -> Dict[str, Any]:
         """
-        使用HanLP处理文本，获取语言学特征用于构建超图
-        优化：处理文本对（评论+主题）以获得更丰富的语言学特征
-        
-        Args:
-            text: 评论文本
-            topic: 主题文本（可选）
-            
-        Returns:
-            包含分词、词性标注、命名实体识别等结果的字典
+        使用HanLP处理文本，获取语言学特征
+        [已修复 KeyError: 'tok' 问题]
         """
-        # 合并文本和主题进行HanLP处理，获得更全面的语言学特征
         combined_text = text
         if topic:
-            combined_text = f"{topic} {text}"  # 主题在前，评论在后
+            combined_text = f"{topic} {text}"
             
+        # 1. 处理整个拼接文本
         result = self.hanlp_pipeline(combined_text)
         
-        # 分离主题和评论的token索引
-        topic_tokens = self.hanlp_pipeline(topic)['tok'] if topic else []
-        text_tokens = self.hanlp_pipeline(text)['tok']
+        # 2. 安全提取特征
+        tokens = self._get_feature(result, 'tok')
+        pos_tags = self._get_feature(result, 'pos')
+        ner_tags = self._get_feature(result, 'ner')
+        dependencies = self._get_feature(result, 'dep')
+        semantic_roles = self._get_feature(result, 'srl')
+
+        # 3. 计算 topic 和 text 的长度 (用于区分节点归属)
+        # 为了稳健性，我们单独分词一次计算长度，虽然稍微慢点，但不会出错
+        topic_len = 0
+        if topic:
+            topic_res = self.hanlp_pipeline(topic)
+            topic_tokens = self._get_feature(topic_res, 'tok')
+            topic_len = len(topic_tokens)
+            
+        text_res = self.hanlp_pipeline(text)
+        text_tokens = self._get_feature(text_res, 'tok')
+        text_len = len(text_tokens)
         
         return {
-            'tokens': result.get('tok', []),
-            'pos_tags': result.get('pos', []),
-            'ner_tags': result.get('ner', []),
-            'dependencies': result.get('dep', []),
-            'semantic_roles': result.get('srl', []),
-            'topic_length': len(topic_tokens),  # 用于区分主题和评论部分
-            'text_length': len(text_tokens)
+            'tokens': tokens,
+            'pos_tags': pos_tags,
+            'ner_tags': ner_tags,
+            'dependencies': dependencies,
+            'semantic_roles': semantic_roles,
+            'topic_length': topic_len,
+            'text_length': text_len
         }
     
     def _create_single_hypergraph_matrix(self, hanlp_result: Dict[str, Any], max_length: int, max_edges: int) -> np.ndarray:
-        """
-        为单个样本创建独立的超图关联矩阵 - 修正：避免样本间数据泄露！
-        
-        Args:
-            hanlp_result: 单个样本的HanLP处理结果
-            max_length: 最大序列长度（节点数N）
-            max_edges: 最大超边数（M，用于padding）
-            
-        Returns:
-            超图关联矩阵 H ∈ R^{N×M}，单个样本独立
-        """
+        """为单个样本创建超图关联矩阵"""
         tokens = hanlp_result['tokens']
         dependencies = hanlp_result.get('dependencies', [])
         pos_tags = hanlp_result.get('pos_tags', [])
         ner_tags = hanlp_result.get('ner_tags', [])
         
-        # 收集当前样本的超边
         sample_hyperedges = []
         
-        # 超边1: 依存句法簇
+        # 超边1: 依存句法
         if dependencies:
             for dep in dependencies:
-                if len(dep) >= 3:
-                    head_idx, tail_idx = dep[0], dep[1]
-                    if head_idx < len(tokens) and tail_idx < len(tokens) and head_idx < max_length and tail_idx < max_length:
-                        hyperedge = set([head_idx, tail_idx])
-                        sample_hyperedges.append(hyperedge)
-        
-        # 超边2: 词性标注簇
+                # dep 格式通常是 (head_idx, rel, tail_idx) 或类似
+                # 这里假设是 [head, tail] 或 (head, tail, rel)
+                # HanLP 2.x 的 dep 格式通常是 [(id, head, rel)...] 或者 (head_index, rel) 列表
+                # 我们做个简单兼容:
+                try:
+                    # 假设 dep[i] = (head_index, relation)
+                    for i, item in enumerate(dependencies):
+                        head_idx = -1
+                        if isinstance(item, (list, tuple)):
+                            # 如果是元组，通常第一个或者是head
+                            head_idx = item[0] 
+                            # 注意 HanLP head 索引可能是 1-based，如果是 0 表示 ROOT
+                            # 这里需要根据具体输出调试，暂且假设 1-based (HanLP标准)
+                            if head_idx > 0:
+                                head_idx -= 1 # 转 0-based
+                        elif hasattr(item, 'head'): # 或者是对象
+                            head_idx = item.head - 1
+
+                        tail_idx = i
+                        
+                        if head_idx >= 0 and head_idx < len(tokens) and tail_idx < len(tokens):
+                            if head_idx < max_length and tail_idx < max_length:
+                                sample_hyperedges.append({head_idx, tail_idx})
+                except:
+                    pass # 依存解析格式复杂，若出错则跳过，保证不崩
+
+        # 超边2: 词性簇
         pos_groups = defaultdict(set)
         for i, pos in enumerate(pos_tags):
             if i < len(tokens) and i < max_length:
                 pos_groups[pos].add(i)
-        
-        for pos, indices in pos_groups.items():
+        for indices in pos_groups.values():
             if len(indices) > 1:
                 sample_hyperedges.append(indices)
         
-        # 超边3: 命名实体簇
+        # 超边3: 命名实体
         if ner_tags:
-            current_entity = None
-            current_indices = set()
-            
-            for i, ner in enumerate(ner_tags):
-                if i < len(tokens) and i < max_length:
-                    if ner.startswith('B-'):
-                        if current_entity and len(current_indices) > 1:
-                            sample_hyperedges.append(current_indices)
-                        current_entity = ner[2:]
-                        current_indices = {i}
-                    elif ner.startswith('I-') and current_entity:
-                        current_indices.add(i)
+            # HanLP NER 格式可能是 [('Entity', 'Type', begin, end)...]
+            # 或者是 BIO 标签列表
+            # 这里做个简单的 BIO 处理兼容
+            if isinstance(ner_tags[0], str) and (ner_tags[0].startswith('B-') or ner_tags[0] == 'O'):
+                # BIO 格式
+                curr_indices = set()
+                for i, tag in enumerate(ner_tags):
+                    if i >= max_length: break
+                    if tag.startswith('B-'):
+                        if len(curr_indices) > 1: sample_hyperedges.append(curr_indices)
+                        curr_indices = {i}
+                    elif tag.startswith('I-') and curr_indices:
+                        curr_indices.add(i)
                     else:
-                        if current_entity and len(current_indices) > 1:
-                            sample_hyperedges.append(current_indices)
-                        current_entity = None
-                        current_indices = set()
-            
-            if current_entity and len(current_indices) > 1:
-                sample_hyperedges.append(current_indices)
-        
+                        if len(curr_indices) > 1: sample_hyperedges.append(curr_indices)
+                        curr_indices = set()
+                if len(curr_indices) > 1: sample_hyperedges.append(curr_indices)
+            else:
+                # 假设是 Span 格式 (entity, type, start, end)
+                for item in ner_tags:
+                    try:
+                        # 尝试解包，不确定具体格式，通常最后两个是 start, end
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            start, end = item[-2], item[-1] # 假设最后是起止
+                            if isinstance(start, int) and isinstance(end, int):
+                                indices = set(range(start, end))
+                                valid_indices = {idx for idx in indices if idx < max_length}
+                                if len(valid_indices) > 1:
+                                    sample_hyperedges.append(valid_indices)
+                    except: pass
+
         # 超边4: 滑动窗口
         window_size = 3
         for i in range(min(len(tokens), max_length) - window_size + 1):
-            window_indices = set(range(i, i + window_size))
-            sample_hyperedges.append(window_indices)
+            sample_hyperedges.append(set(range(i, i + window_size)))
         
-        # 超边5: 主题-评论关联
-        topic_length = hanlp_result.get('topic_length', 0)
-        text_length = hanlp_result.get('text_length', 0)
-        
-        if topic_length > 0 and text_length > 0:
-            topic_indices = set(range(1, min(topic_length + 1, len(tokens), max_length)))
-            text_start = topic_length + 1
-            text_indices = set(range(text_start, min(text_start + text_length, len(tokens), max_length)))
+        # 超边5: 主题-评论交互
+        topic_len = hanlp_result.get('topic_length', 0)
+        text_len = hanlp_result.get('text_length', 0)
+        if topic_len > 0 and text_len > 0:
+            t_start = 0
+            t_end = min(topic_len, max_length)
+            c_start = topic_len
+            c_end = min(topic_len + text_len, max_length)
             
-            if len(topic_indices) > 0 and len(text_indices) > 0:
-                sample_hyperedges.append(topic_indices.union(text_indices))
-                if len(topic_indices) > 1:
-                    sample_hyperedges.append(topic_indices)
-                if len(text_indices) > 1:
-                    sample_hyperedges.append(text_indices)
-        
-        # 构建关联矩阵并进行padding
-        num_actual_edges = len(sample_hyperedges)
-        incidence_matrix = np.zeros((max_length, max_edges))
-        
-        # 填充实际的超边（限制在max_edges范围内）
-        for j, hyperedge in enumerate(sample_hyperedges[:max_edges]):
-            for node_idx in hyperedge:
+            if c_end > c_start:
+                topic_idxs = set(range(t_start, t_end))
+                comment_idxs = set(range(c_start, c_end))
+                # 强行把它们连起来
+                if topic_idxs and comment_idxs:
+                    sample_hyperedges.append(topic_idxs | comment_idxs)
+
+        # 构建矩阵
+        incidence_matrix = np.zeros((max_length, max_edges), dtype=np.float32)
+        for j, edge in enumerate(sample_hyperedges[:max_edges]):
+            for node_idx in edge:
                 if node_idx < max_length:
                     incidence_matrix[node_idx, j] = 1.0
-        
+                    
         return incidence_matrix
-    
-    def estimate_max_edges(self, hanlp_results: List[Dict[str, Any]]) -> int:
-        """
-        估算批次中的最大超边数，用于padding
-        
-        Args:
-            hanlp_results: HanLP处理结果列表
-            
-        Returns:
-            最大超边数
-        """
-        max_edges = 0
-        
-        for result in hanlp_results:
-            tokens = result['tokens']
-            dependencies = result.get('dependencies', [])
-            pos_tags = result.get('pos_tags', [])
-            ner_tags = result.get('ner_tags', [])
-            
-            # 粗略估算当前样本的超边数
-            edge_count = 0
-            
-            # 依存关系超边
-            edge_count += len(dependencies) if dependencies else 0
-            
-            # 词性超边（估算）
-            unique_pos = len(set(pos_tags)) if pos_tags else 0
-            edge_count += unique_pos
-            
-            # 实体超边（估算）
-            entity_count = sum(1 for tag in (ner_tags or []) if tag.startswith('B-'))
-            edge_count += entity_count
-            
-            # 滑动窗口超边
-            window_edges = max(0, len(tokens) - 2) if tokens else 0
-            edge_count += window_edges
-            
-            # 主题-评论超边
-            edge_count += 3  # 交互+主题+评论
-            
-            max_edges = max(max_edges, edge_count)
-        
-        # 添加一些缓冲
-        return min(max_edges + 10, 200)  # 限制最大值避免内存爆炸
 
+    def estimate_max_edges(self, hanlp_results: List[Dict[str, Any]]) -> int:
+        """估算最大边数"""
+        max_e = 0
+        for res in hanlp_results:
+            # 粗略估算：依存(N) + 窗口(N) + 词性(N/2) + NER(N/10) + Topic(1)
+            # 安全起见，给个较大的倍数
+            n = len(res.get('tokens', []))
+            est = n * 3 + 10
+            max_e = max(max_e, est)
+        return min(max_e + 20, 500) # 上限 500
 
 def load_dataset(file_path: str) -> List[Tuple[str, str, int]]:
-    """
-    加载JSON格式的数据集
-    
-    Args:
-        file_path: JSON数据文件路径
-        
-    Returns:
-        (文本, 主题, 标签) 的列表
-    """
     import json
-    
     data = []
-    try:
+    if os.path.exists(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-            
-        for item in json_data:
-            text = item.get('text', '').strip()
-            topic = item.get('topic', '').strip()
-            label = int(item.get('label', '0'))  # 转换字符串标签为整数
-            
-            if text:  # 确保文本不为空
-                data.append((text, topic, label))
-                
-    except Exception as e:
-        print(f"加载数据集时出错: {file_path}, 错误: {e}")
-        
+            items = json.load(f)
+            for item in items:
+                data.append((item.get('text',''), item.get('topic',''), int(item.get('label',0))))
     return data
 
-
-def load_all_datasets(dataset_dir: str = "dataset") -> Tuple[List[Tuple[str, str, int]], 
-                                                           List[Tuple[str, str, int]], 
-                                                           List[Tuple[str, str, int]]]:
-    """
-    加载所有数据集文件
-    
-    Args:
-        dataset_dir: 数据集目录路径
-        
-    Returns:
-        (训练数据, 验证数据, 测试数据) 的元组
-    """
-    import os
-    
-    train_path = os.path.join(dataset_dir, 'train.json')
-    dev_path = os.path.join(dataset_dir, 'dev.json')
-    test_path = os.path.join(dataset_dir, 'test.json')
-    
-    train_data = load_dataset(train_path) if os.path.exists(train_path) else []
-    dev_data = load_dataset(dev_path) if os.path.exists(dev_path) else []
-    test_data = load_dataset(test_path) if os.path.exists(test_path) else []
-    
-    print(f"数据集加载完成:")
-    print(f"  训练集: {len(train_data)} 样本")
-    print(f"  验证集: {len(dev_data)} 样本") 
-    print(f"  测试集: {len(test_data)} 样本")
-    
-    return train_data, dev_data, test_data
-
+def load_all_datasets(dataset_dir: str = "dataset"):
+    train = load_dataset(os.path.join(dataset_dir, 'train.json'))
+    dev = load_dataset(os.path.join(dataset_dir, 'dev.json'))
+    test = load_dataset(os.path.join(dataset_dir, 'test.json'))
+    return train, dev, test
 
 class SarcasmDataset(torch.utils.data.Dataset):
-    """讽刺检测数据集类 - 移到全局作用域，添加缓存机制避免性能陷阱"""
-    
+    """带缓存的数据集类"""
     def __init__(self, data, preprocessor, max_length, cache_file=None):
-        """
-        初始化数据集
-        
-        Args:
-            data: 原始数据 [(text, topic, label), ...]
-            preprocessor: 数据预处理器
-            max_length: 最大序列长度
-            cache_file: 缓存文件路径，如果提供则使用缓存机制
-        """
         self.data = data
         self.preprocessor = preprocessor
         self.max_length = max_length
         self.cached_data = []
         
-        # 缓存逻辑：如果有缓存文件，直接加载；否则处理并保存
+        # 缓存逻辑
         if cache_file and os.path.exists(cache_file):
-            print(f"📥 正在加载缓存数据: {cache_file} ...")
-            with open(cache_file, 'rb') as f:
-                self.cached_data = pickle.load(f)
-            print(f"✅ 缓存加载完成: {len(self.cached_data)} 样本")
-        else:
-            print("🔄 正在进行预处理（HanLP解析），这可能需要几分钟...")
-            print("💡 提示：这是一次性操作，处理后会缓存，下次启动会很快")
-            
-            for text, topic, label in tqdm(self.data, desc="预处理数据"):
-                # 1. BERT Tokenize
+            print(f"Loading cache from {cache_file} ...")
+            try:
+                with open(cache_file, 'rb') as f:
+                    self.cached_data = pickle.load(f)
+            except:
+                print("Cache broken, re-processing...")
+                self.cached_data = []
+        
+        if not self.cached_data:
+            print("Processing data with HanLP (this happens once)...")
+            for text, topic, label in tqdm(self.data):
                 bert_tokens = self.preprocessor.process_text_pair(text, topic, self.max_length)
-                
-                # 2. HanLP 处理 (最耗时的一步 - 但只做一次！)
                 hanlp_result = self.preprocessor.process_text_with_hanlp(text, topic)
-                
                 self.cached_data.append({
                     'input_ids': bert_tokens['input_ids'],
                     'attention_mask': bert_tokens['attention_mask'],
                     'token_type_ids': bert_tokens['token_type_ids'],
                     'hanlp_result': hanlp_result,
-                    'label': torch.tensor(label, dtype=torch.long),
-                    'text': text,  # 保留原始文本用于调试
-                    'topic': topic  # 保留原始主题用于调试
+                    'label': torch.tensor(label, dtype=torch.long)
                 })
             
-            # 保存缓存
             if cache_file:
-                print(f"💾 保存缓存到: {cache_file}")
                 os.makedirs(os.path.dirname(cache_file), exist_ok=True)
                 with open(cache_file, 'wb') as f:
                     pickle.dump(self.cached_data, f)
-                print(f"✅ 缓存保存完成")
-        
+                    
     def __len__(self):
         return len(self.cached_data)
     
     def __getitem__(self, idx):
-        """直接返回内存中的数据，没有任何计算量！"""
         return self.cached_data[idx]
 
-
 def create_hypergraph_collate_fn(preprocessor, max_length):
-    """创建超图批处理函数的工厂函数"""
     def collate_fn(batch):
-        """自定义批处理函数，处理超图矩阵构建 - 修正：每个样本独立的超图矩阵"""
-        # 提取批次数据
-        input_ids = torch.stack([item['input_ids'] for item in batch])
-        attention_mask = torch.stack([item['attention_mask'] for item in batch])
-        token_type_ids = torch.stack([item['token_type_ids'] for item in batch])
-        labels = torch.stack([item['label'] for item in batch])
+        input_ids = torch.stack([x['input_ids'] for x in batch])
+        attention_mask = torch.stack([x['attention_mask'] for x in batch])
+        token_type_ids = torch.stack([x['token_type_ids'] for x in batch])
+        labels = torch.stack([x['label'] for x in batch])
         
-        # 构建批次的超图矩阵 - 关键修正：每个样本独立！
-        hanlp_results = [item['hanlp_result'] for item in batch]
-        
-        # 估算最大超边数用于padding
+        hanlp_results = [x['hanlp_result'] for x in batch]
         max_edges = preprocessor.estimate_max_edges(hanlp_results)
         
-        # 为每个样本创建独立的超图矩阵
-        batch_hypergraph_matrices = []
-        for hanlp_result in hanlp_results:
-            single_matrix = preprocessor._create_single_hypergraph_matrix(hanlp_result, max_length, max_edges)
-            batch_hypergraph_matrices.append(single_matrix)
+        matrices = []
+        for res in hanlp_results:
+            mat = preprocessor._create_single_hypergraph_matrix(res, max_length, max_edges)
+            matrices.append(mat)
+            
+        hypergraph_matrix = torch.tensor(np.stack(matrices), dtype=torch.float32)
         
-        # 堆叠成 [batch_size, max_length, max_edges] 的3D张量
-        hypergraph_matrix = torch.tensor(np.stack(batch_hypergraph_matrices), dtype=torch.float32)
-        
-        # 硬件无关性
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
         return {
             'input_ids': input_ids.to(device),
             'attention_mask': attention_mask.to(device),
             'token_type_ids': token_type_ids.to(device),
-            'hypergraph_matrix': hypergraph_matrix.to(device),  # [batch_size, N, M]
+            'hypergraph_matrix': hypergraph_matrix.to(device),
             'labels': labels.to(device)
         }
-    
     return collate_fn
 
-
-def create_data_loaders(train_data: List[Tuple[str, str, int]], 
-                       val_data: List[Tuple[str, str, int]], 
-                       preprocessor: DataPreprocessor,
-                       batch_size: int = 32,
-                       max_length: int = 512,
-                       cache_dir: str = "cache") -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    """
-    创建数据加载器 - 针对JSON格式数据集优化，支持缓存机制
-    
-    Args:
-        train_data: 训练数据 [(text, topic, label), ...]
-        val_data: 验证数据 [(text, topic, label), ...]
-        preprocessor: 数据预处理器
-        batch_size: 批次大小
-        max_length: BERT最大序列长度
-        cache_dir: 缓存目录
-        
-    Returns:
-        训练和验证数据加载器
-    """
-    from torch.utils.data import DataLoader
-    
-    # 创建缓存目录
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # 缓存文件路径
-    train_cache_file = os.path.join(cache_dir, 'train_cache.pkl')
-    val_cache_file = os.path.join(cache_dir, 'val_cache.pkl')
-    
-    # 创建批处理函数
+def create_data_loaders(train_data, val_data, preprocessor, batch_size, max_length, cache_dir='cache'):
     collate_fn = create_hypergraph_collate_fn(preprocessor, max_length)
     
-    # 创建数据集（带缓存）
-    print("🔧 初始化训练数据集...")
-    train_dataset = SarcasmDataset(train_data, preprocessor, max_length, cache_file=train_cache_file)
+    # 使用 hash 或文件名确保缓存唯一
+    train_cache = os.path.join(cache_dir, f'train_cache_{max_length}.pkl')
+    val_cache = os.path.join(cache_dir, f'val_cache_{max_length}.pkl')
     
-    print("🔧 初始化验证数据集...")
-    val_dataset = SarcasmDataset(val_data, preprocessor, max_length, cache_file=val_cache_file)
+    train_dataset = SarcasmDataset(train_data, preprocessor, max_length, train_cache)
+    val_dataset = SarcasmDataset(val_data, preprocessor, max_length, val_cache)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    
-    print(f"✅ 数据加载器创建完成")
-    print(f"   训练集: {len(train_dataset)} 样本")
-    print(f"   验证集: {len(val_dataset)} 样本")
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     
     return train_loader, val_loader

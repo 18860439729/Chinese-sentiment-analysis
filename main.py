@@ -391,7 +391,8 @@ def main():
     
     # 绘制混淆矩阵
     confusion_matrix_path = os.path.join(args.save_dir, 'confusion_matrix.png')
-    Visualizer.plot_confusion_matrix(true_labels, predictions, save_path=confusion_matrix_path)
+    # 告诉画图工具，0是正常，1是讽刺
+    Visualizer.plot_confusion_matrix(true_labels, predictions, labels=['Normal', 'Sarcastic'], save_path=confusion_matrix_path)
     
     # 如果有测试数据，进行测试
     if test_data and len(test_data) > 0:
