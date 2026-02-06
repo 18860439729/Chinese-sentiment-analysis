@@ -11,8 +11,14 @@ import argparse
 import os
 import time
 from typing import Dict, Any, List, Tuple
-# 修改后 (增加 SarcasmDataset 的引用)
-from data_preprocess import DataPreprocessor, load_all_datasets, create_data_loaders, SarcasmDataset
+
+from data_preprocess import (
+    DataPreprocessor, 
+    load_all_datasets, 
+    create_data_loaders, 
+    SarcasmDataset,
+    create_hypergraph_collate_fn  # 新增：用于测试集
+)
 from model import BertHGNNModel
 from utils import (
     set_seed, setup_logging, save_config, load_config, EarlyStopping,
@@ -27,8 +33,7 @@ def parse_args():
     
     # 数据相关参数
     parser.add_argument('--dataset_dir', type=str, default='dataset', help='数据集目录路径')
-    parser.add_argument('--use_preprocessed', action='store_true', help='使用离线预处理的数据（推荐）')
-    parser.add_argument('--preprocessed_dir', type=str, default='preprocessed_data', help='预处理数据目录')
+    parser.add_argument('--cache_dir', type=str, default='cache', help='缓存目录路径')
     parser.add_argument('--train_data', type=str, help='训练数据路径（可选，默认使用dataset/train.json）')
     parser.add_argument('--val_data', type=str, help='验证数据路径（可选，默认使用dataset/dev.json）')
     parser.add_argument('--test_data', type=str, help='测试数据路径（可选，默认使用dataset/test.json）')
@@ -45,7 +50,7 @@ def parse_args():
     parser.add_argument('--freeze_bert', action='store_true', help='是否冻结BERT参数')
     
     # 训练相关参数
-    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--learning_rate', type=float, default=2e-5, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='权重衰减')
@@ -195,51 +200,30 @@ def main():
     logger.info("初始化数据预处理器...")
     preprocessor = DataPreprocessor(bert_model_name=args.bert_model)
     
-    # 加载数据 - 支持离线预处理模式
-    if args.use_preprocessed:
-        logger.info("🚀 使用离线预处理数据（快速模式）...")
-        from preprocess_offline import load_preprocessed_data, create_fast_data_loaders
-        
-        train_data, val_data, test_data = load_preprocessed_data(args.preprocessed_dir)
-        
-        if not train_data or not val_data:
-            logger.error("❌ 未找到预处理数据！请先运行: python preprocess_offline.py")
-            return
-        
-        # 创建快速数据加载器
-        train_loader, val_loader = create_fast_data_loaders(
-            train_data, val_data, args.batch_size
-        )
-        
-        logger.info(f"✅ 预处理数据加载完成:")
-        logger.info(f"  训练数据: {len(train_data)} 样本")
-        logger.info(f"  验证数据: {len(val_data)} 样本")
-        if test_data:
-            logger.info(f"  测试数据: {len(test_data)} 样本")
-            
+    # 加载数据 - 使用内置缓存机制
+    logger.info("📥 加载数据集...")
+    
+    if args.train_data and args.val_data:
+        # 使用指定的数据文件路径
+        from data_preprocess import load_dataset
+        train_data = load_dataset(args.train_data)
+        val_data = load_dataset(args.val_data)
+        test_data = load_dataset(args.test_data) if args.test_data else []
     else:
-        logger.info("⚠️  使用实时处理模式（较慢）...")
-        logger.info("💡 建议先运行 python preprocess_offline.py 进行离线预处理")
-        
-        if args.train_data and args.val_data:
-            # 使用指定的数据文件路径
-            from data_preprocess import load_dataset
-            train_data = load_dataset(args.train_data)
-            val_data = load_dataset(args.val_data)
-            test_data = load_dataset(args.test_data) if args.test_data else []
-        else:
-            # 使用默认的数据集目录
-            train_data, val_data, test_data = load_all_datasets(args.dataset_dir)
-        
-        logger.info(f"训练数据: {len(train_data)} 样本")
-        logger.info(f"验证数据: {len(val_data)} 样本")
-        if test_data:
-            logger.info(f"测试数据: {len(test_data)} 样本")
-        
-        # 创建数据加载器
-        train_loader, val_loader = create_data_loaders(
-            train_data, val_data, preprocessor, args.batch_size, max_length=512
-        )
+        # 使用默认的数据集目录
+        train_data, val_data, test_data = load_all_datasets(args.dataset_dir)
+    
+    logger.info(f"训练数据: {len(train_data)} 样本")
+    logger.info(f"验证数据: {len(val_data)} 样本")
+    if test_data:
+        logger.info(f"测试数据: {len(test_data)} 样本")
+    
+    # 创建数据加载器（内置缓存机制，第一次运行会慢，之后会很快）
+    logger.info("🔧 创建数据加载器（内置缓存机制）...")
+    logger.info("💡 第一次运行会进行HanLP预处理并缓存，之后启动会很快")
+    train_loader, val_loader = create_data_loaders(
+        train_data, val_data, preprocessor, args.batch_size, max_length=256, cache_dir=args.cache_dir
+    )
     
     # 初始化模型 - 硬件无关性标准写法
     logger.info("初始化模型...")
@@ -412,11 +396,29 @@ def main():
     # 如果有测试数据，进行测试
     if test_data and len(test_data) > 0:
         logger.info("在测试集上评估...")
-        # 创建测试数据加载器
-        from torch.utils.data import DataLoader
-        test_dataset = SarcasmDataset(test_data, preprocessor, 512)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
         
+        # 修复：创建 collate_fn 和测试数据加载器
+        logger.info("🔧 创建测试数据加载器...")
+        
+        # 1. 创建 collate_fn（使用与训练相同的配置）
+        test_collate_fn = create_hypergraph_collate_fn(preprocessor, max_length=256)
+        
+        # 2. 创建测试数据集（带缓存）
+        test_cache_file = os.path.join(args.cache_dir, 'test_cache.pkl')
+        test_dataset = SarcasmDataset(test_data, preprocessor, 256, cache_file=test_cache_file)
+        
+        # 3. 创建 DataLoader（注意：num_workers=0 因为 collate_fn 里用了 .to(device)）
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=args.batch_size, 
+            shuffle=False, 
+            collate_fn=test_collate_fn,
+            num_workers=0  # 重要：避免多进程与GPU冲突
+        )
+        
+        logger.info(f"✅ 测试数据加载器创建完成: {len(test_dataset)} 样本")
+        
+        # 评估测试集
         test_loss, test_acc, test_predictions, test_labels = validate_epoch(model, test_loader, criterion, device)
         logger.info(f"测试准确率: {test_acc:.4f}")
         

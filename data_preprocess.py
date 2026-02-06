@@ -10,6 +10,9 @@ from typing import List, Dict, Tuple, Any
 import networkx as nx
 from collections import defaultdict
 from transformers import BertTokenizer
+import os
+import pickle
+from tqdm import tqdm
 
 
 class DataPreprocessor:
@@ -98,50 +101,6 @@ class DataPreprocessor:
             'topic_length': len(topic_tokens),  # 用于区分主题和评论部分
             'text_length': len(text_tokens)
         }
-    
-    def build_hypergraph_structure(self, text_pairs: List[Tuple[str, str]], max_length: int = 512) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        构建超图结构 - 针对文本对（评论+主题）优化
-        
-        Args:
-            text_pairs: (评论, 主题) 文本对列表
-            max_length: BERT最大序列长度
-            
-        Returns:
-            input_ids: BERT输入token IDs
-            attention_mask: BERT注意力掩码
-            token_type_ids: BERT token类型IDs
-            hypergraph_matrix: 超图关联矩阵 H ∈ R^{N×M} (N个节点，M条超边)
-        """
-        # 使用BERT tokenizer处理所有文本对
-        all_input_ids = []
-        all_attention_masks = []
-        all_token_type_ids = []
-        all_hanlp_results = []
-        
-        for text, topic in text_pairs:
-            # BERT tokenization - 处理文本对
-            bert_tokens = self.process_text_pair(text, topic, max_length)
-            all_input_ids.append(bert_tokens['input_ids'])
-            all_attention_masks.append(bert_tokens['attention_mask'])
-            all_token_type_ids.append(bert_tokens['token_type_ids'])
-            
-            # HanLP处理用于构建超图
-            hanlp_result = self.process_text_with_hanlp(text, topic)
-            all_hanlp_results.append(hanlp_result)
-        
-        # 构建超图关联矩阵 H ∈ R^{N×M}
-        hypergraph_matrix = self._create_hypergraph_incidence_matrix(all_hanlp_results, max_length)
-        
-        # 硬件无关性：自动检测设备并移动张量
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        return (
-            torch.stack(all_input_ids).to(device),
-            torch.stack(all_attention_masks).to(device), 
-            torch.stack(all_token_type_ids).to(device),
-            torch.tensor(hypergraph_matrix, dtype=torch.float32).to(device)
-        )
     
     def _create_single_hypergraph_matrix(self, hanlp_result: Dict[str, Any], max_length: int, max_edges: int) -> np.ndarray:
         """
@@ -346,33 +305,64 @@ def load_all_datasets(dataset_dir: str = "dataset") -> Tuple[List[Tuple[str, str
 
 
 class SarcasmDataset(torch.utils.data.Dataset):
-    """讽刺检测数据集类 - 移到全局作用域"""
-    def __init__(self, data, preprocessor, max_length):
+    """讽刺检测数据集类 - 移到全局作用域，添加缓存机制避免性能陷阱"""
+    
+    def __init__(self, data, preprocessor, max_length, cache_file=None):
+        """
+        初始化数据集
+        
+        Args:
+            data: 原始数据 [(text, topic, label), ...]
+            preprocessor: 数据预处理器
+            max_length: 最大序列长度
+            cache_file: 缓存文件路径，如果提供则使用缓存机制
+        """
         self.data = data
         self.preprocessor = preprocessor
         self.max_length = max_length
+        self.cached_data = []
+        
+        # 缓存逻辑：如果有缓存文件，直接加载；否则处理并保存
+        if cache_file and os.path.exists(cache_file):
+            print(f"📥 正在加载缓存数据: {cache_file} ...")
+            with open(cache_file, 'rb') as f:
+                self.cached_data = pickle.load(f)
+            print(f"✅ 缓存加载完成: {len(self.cached_data)} 样本")
+        else:
+            print("🔄 正在进行预处理（HanLP解析），这可能需要几分钟...")
+            print("💡 提示：这是一次性操作，处理后会缓存，下次启动会很快")
+            
+            for text, topic, label in tqdm(self.data, desc="预处理数据"):
+                # 1. BERT Tokenize
+                bert_tokens = self.preprocessor.process_text_pair(text, topic, self.max_length)
+                
+                # 2. HanLP 处理 (最耗时的一步 - 但只做一次！)
+                hanlp_result = self.preprocessor.process_text_with_hanlp(text, topic)
+                
+                self.cached_data.append({
+                    'input_ids': bert_tokens['input_ids'],
+                    'attention_mask': bert_tokens['attention_mask'],
+                    'token_type_ids': bert_tokens['token_type_ids'],
+                    'hanlp_result': hanlp_result,
+                    'label': torch.tensor(label, dtype=torch.long),
+                    'text': text,  # 保留原始文本用于调试
+                    'topic': topic  # 保留原始主题用于调试
+                })
+            
+            # 保存缓存
+            if cache_file:
+                print(f"💾 保存缓存到: {cache_file}")
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(self.cached_data, f)
+                print(f"✅ 缓存保存完成")
         
     def __len__(self):
-        return len(self.data)
+        return len(self.cached_data)
     
     def __getitem__(self, idx):
-        text, topic, label = self.data[idx]
-        
-        # 使用BERT tokenizer处理文本对
-        bert_tokens = self.preprocessor.process_text_pair(text, topic, self.max_length)
-        
-        # 使用HanLP处理用于超图构建
-        hanlp_result = self.preprocessor.process_text_with_hanlp(text, topic)
-        
-        return {
-            'input_ids': bert_tokens['input_ids'],
-            'attention_mask': bert_tokens['attention_mask'],
-            'token_type_ids': bert_tokens['token_type_ids'],
-            'hanlp_result': hanlp_result,
-            'label': torch.tensor(label, dtype=torch.long),
-            'text': text,  # 保留原始文本用于调试
-            'topic': topic  # 保留原始主题用于调试
-        }
+        """直接返回内存中的数据，没有任何计算量！"""
+        return self.cached_data[idx]
 
 
 def create_hypergraph_collate_fn(preprocessor, max_length):
@@ -418,9 +408,10 @@ def create_data_loaders(train_data: List[Tuple[str, str, int]],
                        val_data: List[Tuple[str, str, int]], 
                        preprocessor: DataPreprocessor,
                        batch_size: int = 32,
-                       max_length: int = 512) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+                       max_length: int = 512,
+                       cache_dir: str = "cache") -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
-    创建数据加载器 - 针对JSON格式数据集优化
+    创建数据加载器 - 针对JSON格式数据集优化，支持缓存机制
     
     Args:
         train_data: 训练数据 [(text, topic, label), ...]
@@ -428,19 +419,35 @@ def create_data_loaders(train_data: List[Tuple[str, str, int]],
         preprocessor: 数据预处理器
         batch_size: 批次大小
         max_length: BERT最大序列长度
+        cache_dir: 缓存目录
         
     Returns:
         训练和验证数据加载器
     """
     from torch.utils.data import DataLoader
     
+    # 创建缓存目录
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # 缓存文件路径
+    train_cache_file = os.path.join(cache_dir, 'train_cache.pkl')
+    val_cache_file = os.path.join(cache_dir, 'val_cache.pkl')
+    
     # 创建批处理函数
     collate_fn = create_hypergraph_collate_fn(preprocessor, max_length)
     
-    train_dataset = SarcasmDataset(train_data, preprocessor, max_length)
-    val_dataset = SarcasmDataset(val_data, preprocessor, max_length)
+    # 创建数据集（带缓存）
+    print("🔧 初始化训练数据集...")
+    train_dataset = SarcasmDataset(train_data, preprocessor, max_length, cache_file=train_cache_file)
+    
+    print("🔧 初始化验证数据集...")
+    val_dataset = SarcasmDataset(val_data, preprocessor, max_length, cache_file=val_cache_file)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    print(f"✅ 数据加载器创建完成")
+    print(f"   训练集: {len(train_dataset)} 样本")
+    print(f"   验证集: {len(val_dataset)} 样本")
     
     return train_loader, val_loader
