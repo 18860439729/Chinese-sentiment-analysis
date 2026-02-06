@@ -44,6 +44,7 @@ Python 解释器路径：如果你在 .vscode/settings.json 里配置了某个 C
 
 
 # BERT + HGNN + Attention 文本分类模型
+# BERT + HGNN + Attention 文本分类模型
 这是一个结合了BERT、超图神经网络(HGNN)和注意力机制的文本分类模型的模块化实现。
 
 ## 项目结构
