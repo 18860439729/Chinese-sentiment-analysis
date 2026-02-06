@@ -429,6 +429,10 @@ def main():
         for metric, value in test_metrics.items():
             logger.info(f"{metric}: {value:.4f}")
 
+        # 绘制测试集混淆矩阵
+        test_confusion_matrix_path = os.path.join(args.save_dir, 'test_confusion_matrix.png')
+        Visualizer.plot_confusion_matrix(test_labels, test_predictions, labels=['Normal', 'Sarcastic'], save_path=test_confusion_matrix_path)
+
 
 if __name__ == '__main__':
     main()
