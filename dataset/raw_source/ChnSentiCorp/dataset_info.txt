@@ -1,0 +1,5 @@
+ChnSentiCorp 数据集信息
+==================================================
+来源: HuggingFace - seamew/ChnSentiCorp
+任务: 情感分析（正面/负面）
+文件: ['test.jsonl', 'train.jsonl', 'validation.jsonl']
