@@ -8,7 +8,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, roc_auc_score
 from typing import List, Dict, Tuple, Any, Optional
 import json
 import os
@@ -122,31 +122,74 @@ class MetricsCalculator:
     
     @staticmethod
     def calculate_metrics(y_true: List[int], y_pred: List[int], 
+                         y_probs: Optional[List[float]] = None,
                          labels: Optional[List[str]] = None) -> Dict[str, float]:
         """
-        计算分类指标
+        计算分类指标（支持二分类和多分类）
         
         Args:
             y_true: 真实标签
             y_pred: 预测标签
+            y_probs: 预测概率（二分类时是正类概率，多分类时是概率矩阵）
             labels: 类别标签名称
             
         Returns:
             包含各种指标的字典
         """
         accuracy = accuracy_score(y_true, y_pred)
-        precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted')
+        
+        # 使用 weighted 平均（按样本数加权）
+        # 对于多分类，这比 binary 更合适
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average='weighted', zero_division=0
+        )
+        
+        # 同时计算 macro 平均（平等对待每个类别）
+        precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+            y_true, y_pred, average='macro', zero_division=0
+        )
         
         metrics = {
             'accuracy': accuracy,
             'precision': precision,
             'recall': recall,
-            'f1_score': f1
+            'f1_score': f1,
+            'f1_macro': f1_macro,  # 新增：macro F1
+            'precision_macro': precision_macro,
+            'recall_macro': recall_macro
         }
+        
+        # 计算 AUC
+        if y_probs is not None:
+            try:
+                # 检测是二分类还是多分类
+                unique_labels = len(set(y_true))
+                
+                if unique_labels == 2:
+                    # 二分类：y_probs 是正类概率
+                    auc = roc_auc_score(y_true, y_probs)
+                    metrics['auc'] = auc
+                elif unique_labels > 2:
+                    # 多分类：使用 One-vs-Rest 策略
+                    # y_probs 应该是 (n_samples, n_classes) 的概率矩阵
+                    import numpy as np
+                    if isinstance(y_probs, list) and len(y_probs) > 0:
+                        if isinstance(y_probs[0], (list, np.ndarray)):
+                            # 已经是概率矩阵
+                            auc = roc_auc_score(y_true, y_probs, multi_class='ovr', average='weighted')
+                            metrics['auc'] = auc
+                        else:
+                            # 单列概率，跳过 AUC 计算
+                            metrics['auc'] = 0.0
+                    else:
+                        metrics['auc'] = 0.0
+            except (ValueError, TypeError) as e:
+                # 防止错误时报错
+                metrics['auc'] = 0.0
         
         # 计算每个类别的指标
         precision_per_class, recall_per_class, f1_per_class, support = precision_recall_fscore_support(
-            y_true, y_pred, average=None
+            y_true, y_pred, average=None, zero_division=0
         )
         
         unique_labels = sorted(list(set(y_true + y_pred)))

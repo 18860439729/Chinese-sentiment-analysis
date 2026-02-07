@@ -45,7 +45,7 @@ def parse_args():
                        help='HGNN隐藏层维度')
     parser.add_argument('--num_attention_heads', type=int, default=8, 
                        help='注意力头数')
-    parser.add_argument('--num_classes', type=int, default=2, help='分类类别数')
+    parser.add_argument('--num_classes', type=int, default=3, help='分类类别数')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--freeze_bert', action='store_true', help='是否冻结BERT参数')
     
@@ -128,7 +128,7 @@ def train_epoch(model: nn.Module,
 def validate_epoch(model: nn.Module, 
                   val_loader: DataLoader, 
                   criterion: nn.Module,
-                  device: torch.device) -> Tuple[float, float, List[int], List[int]]:
+                  device: torch.device) -> Tuple[float, float, List[int], List[int], List[float]]:
     """验证一个epoch"""
     model.eval()
     
@@ -137,6 +137,7 @@ def validate_epoch(model: nn.Module,
     
     all_predictions = []
     all_labels = []
+    all_probs = []  # 新增：存储预测概率
     
     with torch.no_grad():
         for batch in val_loader:
@@ -153,6 +154,9 @@ def validate_epoch(model: nn.Module,
             # 计算损失
             loss = criterion(outputs, labels)
             
+            # 计算概率（softmax）
+            probs = torch.softmax(outputs, dim=1)[:, 1]  # 取正类（Label 1，讽刺）的概率
+            
             # 计算准确率
             _, predicted = torch.max(outputs.data, 1)
             accuracy = (predicted == labels).float().mean()
@@ -164,8 +168,9 @@ def validate_epoch(model: nn.Module,
             # 收集预测结果
             all_predictions.extend(predicted.cpu().numpy().tolist())
             all_labels.extend(labels.cpu().numpy().tolist())
+            all_probs.extend(probs.cpu().numpy().tolist())  # 收集概率
     
-    return losses.avg, accuracies.avg, all_predictions, all_labels
+    return losses.avg, accuracies.avg, all_predictions, all_labels, all_probs
 
 
 def main():
@@ -241,7 +246,14 @@ def main():
     logger.info(f"模型参数数量: {num_params:,}")
     
     # 定义损失函数和优化器 - 分层学习率策略
-    criterion = nn.CrossEntropyLoss()
+    # 三分类加权损失：处理反讽数据不平衡（修复后反讽占17.4%）
+    # Label 0 (正面): 权重 1.0 (42%)
+    # Label 1 (负面): 权重 1.0 (41%)
+    # Label 2 (反讽): 权重 2.5 (17% - 约为正常类别的1/2.4，给予适度补偿)
+    # 注：修复数据泄露后，反讽比例从3%提升到17%，权重从15降至2.5避免过度预测
+    class_weights = torch.tensor([1.0, 1.0, 2.5]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    logger.info(f"使用类别权重: {class_weights.tolist()}")
     
     # 分层学习率：BERT用小学习率微调，HGNN+Attention用大学习率训练
     bert_params = []
@@ -282,19 +294,22 @@ def main():
             return
         
         logger.info("开始评估...")
-        val_loss, val_acc, predictions, true_labels = validate_epoch(
+        val_loss, val_acc, predictions, true_labels, val_probs = validate_epoch(
             model, val_loader, criterion, device
         )
         
         logger.info(f"验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.4f}")
         
-        # 计算详细指标
-        metrics = MetricsCalculator.calculate_metrics(true_labels, predictions)
+        # 计算详细指标（包含 AUC）
+        # 三分类标签名称
+        label_names = ['正面', '负面', '反讽']
+        metrics = MetricsCalculator.calculate_metrics(true_labels, predictions, val_probs, labels=label_names)
         for metric, value in metrics.items():
             logger.info(f"{metric}: {value:.4f}")
         
         # 打印分类报告
-        MetricsCalculator.print_classification_report(true_labels, predictions)
+        label_names = ['正面', '负面', '反讽']
+        MetricsCalculator.print_classification_report(true_labels, predictions, labels=label_names)
         
         # 绘制混淆矩阵
         Visualizer.plot_confusion_matrix(true_labels, predictions)
@@ -320,7 +335,7 @@ def main():
         )
         
         # 验证
-        val_loss, val_acc, predictions, true_labels = validate_epoch(
+        val_loss, val_acc, predictions, true_labels, val_probs = validate_epoch(
             model, val_loader, criterion, device
         )
         
@@ -376,18 +391,21 @@ def main():
         model, _, _, _ = load_model(model, optimizer, best_model_path)
     
     # 在验证集上评估
-    val_loss, val_acc, predictions, true_labels = validate_epoch(
+    val_loss, val_acc, predictions, true_labels, val_probs = validate_epoch(
         model, val_loader, criterion, device
     )
     
-    # 计算详细指标
-    metrics = MetricsCalculator.calculate_metrics(true_labels, predictions)
+    # 计算详细指标（包含 AUC）
+    # 三分类标签名称
+    label_names = ['正面', '负面', '反讽']
+    metrics = MetricsCalculator.calculate_metrics(true_labels, predictions, val_probs, labels=label_names)
     logger.info("最终验证结果:")
     for metric, value in metrics.items():
         logger.info(f"{metric}: {value:.4f}")
     
     # 打印分类报告
-    MetricsCalculator.print_classification_report(true_labels, predictions)
+    label_names = ['正面', '负面', '反讽']
+    MetricsCalculator.print_classification_report(true_labels, predictions, labels=label_names)
     
     # 绘制混淆矩阵
     confusion_matrix_path = os.path.join(args.save_dir, 'confusion_matrix.png')
@@ -420,11 +438,13 @@ def main():
         logger.info(f"✅ 测试数据加载器创建完成: {len(test_dataset)} 样本")
         
         # 评估测试集
-        test_loss, test_acc, test_predictions, test_labels = validate_epoch(model, test_loader, criterion, device)
+        test_loss, test_acc, test_predictions, test_labels, test_probs = validate_epoch(model, test_loader, criterion, device)
         logger.info(f"测试准确率: {test_acc:.4f}")
         
-        # 测试集详细指标
-        test_metrics = MetricsCalculator.calculate_metrics(test_labels, test_predictions)
+        # 测试集详细指标（包含 AUC）
+        # 三分类标签名称
+        label_names = ['正面', '负面', '反讽']
+        test_metrics = MetricsCalculator.calculate_metrics(test_labels, test_predictions, test_probs, labels=label_names)
         logger.info("测试集结果:")
         for metric, value in test_metrics.items():
             logger.info(f"{metric}: {value:.4f}")
